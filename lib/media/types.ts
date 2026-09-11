@@ -6,6 +6,7 @@
  *
  * Currently Supported Image Providers:
  * - Seedream (ByteDance SDXL-based image generation)
+ * - OpenAI Image (GPT Image API)
  * - Qwen Image (Alibaba Cloud Wanx image generation)
  * - Nano Banana (Lightweight image generation via Banana.dev)
  *
@@ -13,7 +14,7 @@
  * - Seedance (ByteDance video generation)
  * - Kling (Kuaishou video generation)
  * - Veo (Google DeepMind video generation)
- * - Sora (OpenAI video generation)
+ * - HappyHorse (Alibaba Cloud Model Studio video generation)
  *
  * HOW TO ADD A NEW PROVIDER:
  *
@@ -28,7 +29,7 @@
  * Step 3: Implement provider logic in image-providers.ts or video-providers.ts
  *   - Add case to generateImage() or generateVideo() switch statement
  *   - Implement API call logic for the new provider
- *   - For async task-based providers, implement MediaTaskAdapter
+ *   - For async task-based providers, use runPolledTask from lib/media/polled-task.ts
  *
  * Step 4: Add i18n translations
  *   - Add provider name translations in lib/i18n.ts
@@ -69,7 +70,15 @@
  * Add new image providers here as union members.
  * Keep in sync with IMAGE_PROVIDERS registry in constants.ts
  */
-export type ImageProviderId = 'seedream' | 'qwen-image' | 'nano-banana' | 'grok-image';
+export type ImageProviderId =
+  | 'seedream'
+  | 'openai-image'
+  | 'qwen-image'
+  | 'nano-banana'
+  | 'minimax-image'
+  | 'grok-image'
+  | 'comfyui-image'
+  | 'lemonade';
 // Add new image providers below (uncomment and modify):
 // | 'dall-e'
 // | 'midjourney'
@@ -149,6 +158,10 @@ export interface ImageGenerationOptions {
   aspectRatio?: '16:9' | '4:3' | '1:1' | '9:16';
   /** Optional artistic style (must be supported by the chosen provider) */
   style?: string;
+  /** Owning stage, for server-side attribution of a generation call. */
+  stageId?: string;
+  /** Cancel server-side provider I/O (agent runtime / background callers). */
+  signal?: AbortSignal;
 }
 
 /**
@@ -178,7 +191,13 @@ export interface ImageGenerationResult {
  * Add new video providers here as union members.
  * Keep in sync with VIDEO_PROVIDERS registry in constants.ts
  */
-export type VideoProviderId = 'seedance' | 'kling' | 'veo' | 'sora' | 'grok-video';
+export type VideoProviderId =
+  | 'seedance'
+  | 'kling'
+  | 'veo'
+  | 'minimax-video'
+  | 'grok-video'
+  | 'happyhorse';
 // Add new video providers below (uncomment and modify):
 // | 'runway'
 // | 'pika'
@@ -247,6 +266,10 @@ export interface VideoGenerationOptions {
   aspectRatio?: '16:9' | '4:3' | '1:1' | '9:16' | '3:4' | '21:9';
   /** Desired output resolution */
   resolution?: '480p' | '720p' | '1080p';
+  /** Owning stage, for server-side attribution of a generation call. */
+  stageId?: string;
+  /** Cancel server-side provider I/O (agent runtime / background callers). */
+  signal?: AbortSignal;
 }
 
 /**
@@ -289,32 +312,4 @@ export interface MediaGenerationRequest {
   aspectRatio?: '16:9' | '4:3' | '1:1' | '9:16';
   /** Optional artistic style hint */
   style?: string;
-}
-
-/**
- * Media Task Adapter
- *
- * Generic interface for providers that use an asynchronous task pattern
- * (submit task, then poll for completion). Many image/video generation
- * APIs are async — this adapter abstracts that pattern.
- *
- * @template TOptions - The generation options type (e.g. ImageGenerationOptions)
- * @template TResult - The generation result type (e.g. ImageGenerationResult)
- */
-export interface MediaTaskAdapter<TOptions, TResult> {
-  /**
-   * Submit a generation task to the provider.
-   *
-   * @param options - Generation options for the task
-   * @returns A task ID that can be used to poll for status
-   */
-  submitTask(options: TOptions): Promise<string>;
-
-  /**
-   * Poll the status of a previously submitted task.
-   *
-   * @param taskId - The task ID returned by submitTask()
-   * @returns The generation result if complete, or null if still processing
-   */
-  pollTaskStatus(taskId: string): Promise<TResult | null>;
 }

@@ -70,6 +70,9 @@ export interface DoneItem {
   totalActions: number;
   totalAgents: number;
   agentHadContent?: boolean;
+  cueUserReceived?: boolean;
+  sessionClosed?: boolean;
+  endReason?: string;
   directorState?: DirectorState;
 }
 
@@ -102,7 +105,7 @@ export interface StreamBufferCallbacks {
    */
   onTextReveal(messageId: string, partId: string, revealedText: string, isComplete: boolean): void;
   /** Fired when tick reaches an action item. Callers should execute the effect + add badge. */
-  onActionReady(messageId: string, data: ActionItem): void;
+  onActionReady(messageId: string, data: ActionItem, signal: AbortSignal): void | Promise<void>;
   /**
    * Unified speech feed for the Roundtable bubble.
    * Reports only the CURRENT segment text (resets on action / agent switch).
@@ -121,9 +124,24 @@ export interface StreamBufferCallbacks {
     totalActions: number;
     totalAgents: number;
     agentHadContent?: boolean;
+    cueUserReceived?: boolean;
+    sessionClosed?: boolean;
+    endReason?: string;
     directorState?: DirectorState;
   }): void;
   onError(message: string): void;
+  onSegmentSealed?: (
+    messageId: string,
+    partId: string,
+    fullText: string,
+    agentId: string | null,
+  ) => void;
+  /**
+   * When provided, called after a text item is fully revealed and sealed.
+   * If it returns true, the tick loop will NOT advance to the next item —
+   * the bubble stays on the current text (e.g. waiting for TTS playback to finish).
+   */
+  shouldHoldAfterReveal?: () => { holding: boolean; segmentDone: number } | boolean;
 }
 
 // ─── Options ─────────────────────────────────────────────────────────
@@ -165,6 +183,14 @@ export class StreamBuffer {
 
   // Dwell / delay counters (in ticks)
   private _dwellTicksRemaining = 0;
+  /** True when a text item's post-delay has elapsed and we're waiting for TTS to finish. */
+  private _holdingForTTS = false;
+  private _holdSegmentSnapshot = -1;
+  /** Blocks queue advancement until the current action effect has completed. */
+  private _actionCompletion: Promise<void> | null = null;
+  private _flushing = false;
+  private _flushPromise: Promise<void> | null = null;
+  private readonly lifecycleAbortController = new AbortController();
 
   // Config
   private readonly tickMs: number;
@@ -173,6 +199,7 @@ export class StreamBuffer {
   private readonly actionDelayTicks: number;
   private readonly cb: StreamBufferCallbacks;
   private partCounter = 0;
+  private _drained = false;
   private _drainResolve: (() => void) | null = null;
   private _drainReject: ((err: Error) => void) | null = null;
 
@@ -252,6 +279,9 @@ export class StreamBuffer {
     totalActions: number;
     totalAgents: number;
     agentHadContent?: boolean;
+    cueUserReceived?: boolean;
+    sessionClosed?: boolean;
+    endReason?: string;
     directorState?: DirectorState;
   }): void {
     if (this._disposed) return;
@@ -286,8 +316,16 @@ export class StreamBuffer {
    * Returns a Promise that resolves when the buffer has processed all items
    * including the final `done` item. Rejects if the buffer is disposed/shutdown
    * before draining completes.
+   *
+   * NOTE: This will block indefinitely while the buffer is paused, by design.
+   * Buffer-level pause (see `livePausedRef` in use-chat-sessions) freezes ALL
+   * forward progress — the tick loop is a no-op while `_paused` is true, so
+   * no items are processed and drain never fires until resumed.
    */
   waitUntilDrained(): Promise<void> {
+    if (this._drained) {
+      return Promise.resolve();
+    }
     if (this._disposed) {
       return Promise.reject(new Error('Buffer already disposed'));
     }
@@ -305,58 +343,88 @@ export class StreamBuffer {
     return this._disposed;
   }
 
+  /** Resolves after an action that already started has finished mutating presentation state. */
+  waitForCurrentAction(): Promise<void> {
+    return this._actionCompletion ?? Promise.resolve();
+  }
+
   /**
    * Flush: instantly reveal everything remaining.
    * Used when restoring persisted sessions or force-completing.
    */
-  flush(): void {
-    if (this._disposed) return;
-    while (this.readIndex < this.items.length) {
-      const item = this.items[this.readIndex];
-      switch (item.kind) {
-        case 'text':
-          this.cb.onTextReveal(item.messageId, item.partId, item.text, true);
-          this.currentSegmentText = item.text;
-          this.cb.onLiveSpeech(this.currentSegmentText, this.currentAgentId);
-          this.cb.onSpeechProgress(1);
-          break;
-        case 'action':
-          this.currentSegmentText = '';
-          this.cb.onActionReady(item.messageId, item);
-          this.cb.onLiveSpeech(null, this.currentAgentId);
-          break;
-        case 'agent_start':
-          this.currentAgentId = item.agentId;
-          this.currentSegmentText = '';
-          this.cb.onThinking(null); // Agent selected — clear thinking indicator
-          this.cb.onAgentStart(item);
-          this.cb.onLiveSpeech(null, item.agentId);
-          break;
-        case 'agent_end':
-          this.cb.onAgentEnd(item);
-          break;
-        case 'thinking':
-          this.cb.onThinking(item);
-          break;
-        case 'cue_user':
-          this.cb.onCueUser(item.fromAgentId, item.prompt);
-          break;
-        case 'done':
-          this.cb.onLiveSpeech(null, null);
-          this.cb.onSpeechProgress(null);
-          this.cb.onThinking(null);
-          this.cb.onDone(item);
-          // Resolve drain promise
-          this._drainResolve?.();
-          this._drainResolve = null;
-          this._drainReject = null;
-          break;
-        case 'error':
-          this.cb.onError(item.message);
-          break;
+  flush(): Promise<void> {
+    if (this._disposed) return Promise.resolve();
+    if (this._flushPromise) return this._flushPromise;
+
+    const flushPromise = this.flushRemaining().finally(() => {
+      if (this._flushPromise === flushPromise) {
+        this._flushPromise = null;
       }
-      this.readIndex++;
-      this.charCursor = 0;
+    });
+    this._flushPromise = flushPromise;
+    return flushPromise;
+  }
+
+  private async flushRemaining(): Promise<void> {
+    this._flushing = true;
+    try {
+      await this._actionCompletion;
+      if (this._disposed) return;
+      while (this.readIndex < this.items.length) {
+        if (this._disposed) return;
+        const item = this.items[this.readIndex];
+        switch (item.kind) {
+          case 'text':
+            this.cb.onTextReveal(item.messageId, item.partId, item.text, true);
+            if (this._disposed) return;
+            this.currentSegmentText = item.text;
+            this.cb.onLiveSpeech(this.currentSegmentText, this.currentAgentId);
+            if (this._disposed) return;
+            this.cb.onSpeechProgress(1);
+            break;
+          case 'action':
+            this.currentSegmentText = '';
+            await this.trackAction(item);
+            if (this._disposed) return;
+            this.cb.onLiveSpeech(null, this.currentAgentId);
+            break;
+          case 'agent_start':
+            this.currentAgentId = item.agentId;
+            this.currentSegmentText = '';
+            this.cb.onThinking(null); // Agent selected — clear thinking indicator
+            if (this._disposed) return;
+            this.cb.onAgentStart(item);
+            if (this._disposed) return;
+            this.cb.onLiveSpeech(null, item.agentId);
+            break;
+          case 'agent_end':
+            this.cb.onAgentEnd(item);
+            break;
+          case 'thinking':
+            this.cb.onThinking(item);
+            break;
+          case 'cue_user':
+            this.cb.onCueUser(item.fromAgentId, item.prompt);
+            break;
+          case 'done':
+            this.cb.onLiveSpeech(null, null);
+            if (this._disposed) return;
+            this.cb.onSpeechProgress(null);
+            if (this._disposed) return;
+            this.cb.onThinking(null);
+            if (this._disposed) return;
+            this.cb.onDone(item);
+            this.resolveDrain();
+            break;
+          case 'error':
+            this.cb.onError(item.message);
+            break;
+        }
+        this.readIndex++;
+        this.charCursor = 0;
+      }
+    } finally {
+      this._flushing = false;
     }
   }
 
@@ -364,6 +432,7 @@ export class StreamBuffer {
   dispose(): void {
     if (this._disposed) return;
     this._disposed = true;
+    this.lifecycleAbortController.abort();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -385,6 +454,7 @@ export class StreamBuffer {
   shutdown(): void {
     if (this._disposed) return;
     this._disposed = true;
+    this.lifecycleAbortController.abort();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -403,6 +473,9 @@ export class StreamBuffer {
       const item = this.items[i];
       if (item.kind === 'text' && !item.sealed) {
         item.sealed = true;
+        // Ordering invariant: sealLastText() is called BEFORE pushAgentEnd/pushAgentStart,
+        // so this.currentAgentId still refers to the agent whose text is being sealed.
+        this.cb.onSegmentSealed?.(item.messageId, item.partId, item.text, this.currentAgentId);
         break;
       }
       // Stop searching once we hit a non-text item
@@ -410,12 +483,56 @@ export class StreamBuffer {
     }
   }
 
+  private resolveDrain(): void {
+    this._drained = true;
+    this._drainResolve?.();
+    this._drainResolve = null;
+    this._drainReject = null;
+  }
+
   private tick(): void {
-    if (this._paused || this._disposed) return;
+    if (this._paused || this._disposed || this._flushing) return;
 
     // Honour dwell / action-delay countdown before advancing
     if (this._dwellTicksRemaining > 0) {
       this._dwellTicksRemaining--;
+      if (this._dwellTicksRemaining === 0 && this._holdingForTTS) {
+        // Post-text delay just finished — fall through to the TTS hold check below
+      } else {
+        return;
+      }
+    }
+
+    if (this._actionCompletion) return;
+
+    // TTS hold: after post-text delay, keep the bubble on screen while audio plays
+    if (this._holdingForTTS) {
+      const result = this.cb.shouldHoldAfterReveal?.();
+      if (result) {
+        if (typeof result === 'object') {
+          if (!result.holding) {
+            // TTS queue empty — release
+            this._holdingForTTS = false;
+            this._holdSegmentSnapshot = -1;
+            this.advanceNonText();
+            return;
+          }
+          if (result.segmentDone !== this._holdSegmentSnapshot) {
+            // A segment just finished — release even if next segment is starting
+            this._holdingForTTS = false;
+            this._holdSegmentSnapshot = -1;
+            this.advanceNonText();
+            return;
+          }
+          return; // Same segment still playing — stay on current item
+        }
+        // Boolean form (legacy): hold as long as true
+        return;
+      }
+      this._holdingForTTS = false;
+      this._holdSegmentSnapshot = -1;
+      // TTS done — continue to process next item
+      this.advanceNonText();
       return;
     }
 
@@ -450,7 +567,23 @@ export class StreamBuffer {
           // before the next action or agent turn fires.
           if (this.postTextDelayTicks > 0) {
             this._dwellTicksRemaining = this.postTextDelayTicks;
+            // If TTS hold callback exists, mark that we need to check it after delay
+            if (this.cb.shouldHoldAfterReveal) {
+              this._holdingForTTS = true;
+              const snap = this.cb.shouldHoldAfterReveal();
+              this._holdSegmentSnapshot = typeof snap === 'object' ? snap.segmentDone : -1;
+            }
             return; // next tick will count down, then advanceNonText
+          }
+
+          // No post-text delay — check TTS hold immediately
+          {
+            const result = this.cb.shouldHoldAfterReveal?.();
+            if (result) {
+              this._holdingForTTS = true;
+              this._holdSegmentSnapshot = typeof result === 'object' ? result.segmentDone : -1;
+              return; // TTS still playing — hold here
+            }
           }
 
           // Process any immediately-advanceable items in the same tick
@@ -481,17 +614,7 @@ export class StreamBuffer {
         break;
 
       case 'action':
-        this.currentSegmentText = '';
-        this.cb.onActionReady(item.messageId, item);
-        this.cb.onLiveSpeech(null, this.currentAgentId);
-        this.readIndex++;
-        this.charCursor = 0;
-        // Delay after action so animations have time to play out
-        if (this.actionDelayTicks > 0) {
-          this._dwellTicksRemaining = this.actionDelayTicks;
-          return;
-        }
-        this.advanceNonText();
+        this.startAction(item);
         break;
 
       case 'thinking':
@@ -520,10 +643,7 @@ export class StreamBuffer {
           clearInterval(this.timer);
           this.timer = null;
         }
-        // Resolve drain promise
-        this._drainResolve?.();
-        this._drainResolve = null;
-        this._drainReject = null;
+        this.resolveDrain();
         break;
 
       case 'error':
@@ -560,17 +680,8 @@ export class StreamBuffer {
           this.cb.onAgentEnd(next);
           break;
         case 'action':
-          this.currentSegmentText = '';
-          this.cb.onActionReady(next.messageId, next);
-          this.cb.onLiveSpeech(null, this.currentAgentId);
-          this.readIndex++;
-          this.charCursor = 0;
-          // Pause after action to let animation play
-          if (this.actionDelayTicks > 0) {
-            this._dwellTicksRemaining = this.actionDelayTicks;
-            return; // resume on next tick after countdown
-          }
-          continue; // no delay — keep advancing
+          this.startAction(next);
+          return;
         case 'thinking':
           this.cb.onThinking(next);
           break;
@@ -588,10 +699,7 @@ export class StreamBuffer {
             clearInterval(this.timer);
             this.timer = null;
           }
-          // Resolve drain promise
-          this._drainResolve?.();
-          this._drainResolve = null;
-          this._drainReject = null;
+          this.resolveDrain();
           return; // done — stop advancing
         case 'error':
           this.cb.onError(next.message);
@@ -600,5 +708,42 @@ export class StreamBuffer {
       this.readIndex++;
       this.charCursor = 0;
     }
+  }
+
+  private startAction(item: ActionItem): void {
+    this.currentSegmentText = '';
+    this.cb.onLiveSpeech(null, this.currentAgentId);
+    this.readIndex++;
+    this.charCursor = 0;
+    this._dwellTicksRemaining = this.actionDelayTicks;
+
+    void this.trackAction(item);
+  }
+
+  private trackAction(item: ActionItem): Promise<void> {
+    let completion: Promise<void>;
+    try {
+      completion = Promise.resolve(
+        this.cb.onActionReady(item.messageId, item, this.lifecycleAbortController.signal),
+      );
+    } catch (error) {
+      this.reportActionError(item, error);
+      completion = Promise.resolve();
+    }
+
+    const trackedCompletion = completion
+      .catch((error) => this.reportActionError(item, error))
+      .finally(() => {
+        if (this._actionCompletion === trackedCompletion) {
+          this._actionCompletion = null;
+        }
+      });
+    this._actionCompletion = trackedCompletion;
+    return trackedCompletion;
+  }
+
+  private reportActionError(item: ActionItem, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    this.cb.onError(`Action ${item.actionName} failed: ${message}`);
   }
 }

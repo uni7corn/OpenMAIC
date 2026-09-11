@@ -26,14 +26,17 @@ import {
   Search,
   Volume2,
   Mic,
+  Plus,
+  CreditCard,
+  Sparkles,
 } from 'lucide-react';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { useSettingsStore } from '@/lib/store/settings';
 import { toast } from 'sonner';
 import { type ProviderId } from '@/lib/ai/providers';
-import { PROVIDERS } from '@/lib/ai/providers';
+import { PROVIDERS, MONO_LOGO_PROVIDERS } from '@/lib/ai/providers';
 import { cn } from '@/lib/utils';
-import { getProviderTypeLabel } from './utils';
+import { createCustomProviderSettings, getProviderTypeLabel, modelInfoFromId } from './utils';
 import { ProviderList } from './provider-list';
 import { ProviderConfigPanel } from './provider-config-panel';
 import { PDFSettings } from './pdf-settings';
@@ -52,11 +55,16 @@ import { ASRSettings } from './asr-settings';
 import { ASR_PROVIDERS } from '@/lib/audio/constants';
 import type { ASRProviderId } from '@/lib/audio/types';
 import { WebSearchSettings } from './web-search-settings';
-import { WEB_SEARCH_PROVIDERS } from '@/lib/web-search/constants';
+import { WEB_SEARCH_PROVIDERS, getWebSearchProviderDisplayName } from '@/lib/web-search/constants';
 import type { WebSearchProviderId } from '@/lib/web-search/types';
 import { GeneralSettings } from './general-settings';
+import { SkillSettings } from './skill-settings';
+import { TokenPlanSettings } from './token-plan-settings';
 import { ModelEditDialog } from './model-edit-dialog';
 import { AddProviderDialog, type NewProviderData } from './add-provider-dialog';
+import { AddAudioProviderDialog, type NewAudioProviderData } from './add-audio-provider-dialog';
+import { isCustomTTSProvider, isCustomASRProvider } from '@/lib/audio/types';
+import { resolveASRProviderName, resolveTTSProviderName } from '@/lib/audio/provider-display';
 import type { SettingsSection, EditingModel } from '@/lib/types/settings';
 
 // ─── Provider List Column (reusable) ───
@@ -67,6 +75,7 @@ function ProviderListColumn<T extends string>({
   onSelect,
   width,
   t,
+  onAdd,
 }: {
   providers: Array<{ id: T; name: string; icon?: string }>;
   configs: Record<string, { isServerConfigured?: boolean }>;
@@ -74,6 +83,7 @@ function ProviderListColumn<T extends string>({
   onSelect: (id: T) => void;
   width: number;
   t: (key: string) => string;
+  onAdd?: () => void;
 }) {
   return (
     <div className="flex-shrink-0 bg-background flex flex-col" style={{ width }}>
@@ -93,7 +103,10 @@ function ProviderListColumn<T extends string>({
               <img
                 src={provider.icon}
                 alt={provider.name}
-                className="w-5 h-5 rounded"
+                className={cn(
+                  'w-5 h-5 rounded',
+                  MONO_LOGO_PROVIDERS.has(provider.id) && 'dark:invert',
+                )}
                 onError={(e) => {
                   (e.target as HTMLImageElement).style.display = 'none';
                 }}
@@ -110,61 +123,76 @@ function ProviderListColumn<T extends string>({
           </button>
         ))}
       </div>
+      {onAdd && (
+        <div className="p-3 border-t">
+          <Button variant="outline" size="sm" className="w-full gap-1.5" onClick={onAdd}>
+            <Plus className="h-3.5 w-3.5" />
+            {t('settings.addProviderButton')}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
 
 // ─── Helper: get TTS/ASR provider display name ───
+// The id→i18n-key tables live in lib/audio/provider-display so the generation
+// toolbar resolves provider names the same way this dialog does.
 function getTTSProviderName(providerId: TTSProviderId, t: (key: string) => string): string {
-  const names: Record<TTSProviderId, string> = {
-    'openai-tts': t('settings.providerOpenAITTS'),
-    'azure-tts': t('settings.providerAzureTTS'),
-    'glm-tts': t('settings.providerGLMTTS'),
-    'qwen-tts': t('settings.providerQwenTTS'),
-    'elevenlabs-tts': t('settings.providerElevenLabsTTS'),
-    'browser-native-tts': t('settings.providerBrowserNativeTTS'),
-  };
-  return names[providerId];
+  if (isCustomTTSProvider(providerId)) {
+    const cfg = useSettingsStore.getState().ttsProvidersConfig[providerId];
+    return cfg?.customName || providerId;
+  }
+  return resolveTTSProviderName(providerId, t);
 }
 
 function getASRProviderName(providerId: ASRProviderId, t: (key: string) => string): string {
-  const names: Record<ASRProviderId, string> = {
-    'openai-whisper': t('settings.providerOpenAIWhisper'),
-    'browser-native': t('settings.providerBrowserNative'),
-    'qwen-asr': t('settings.providerQwenASR'),
-  };
-  return names[providerId];
+  if (isCustomASRProvider(providerId)) {
+    const cfg = useSettingsStore.getState().asrProvidersConfig[providerId];
+    return cfg?.customName || providerId;
+  }
+  return resolveASRProviderName(providerId, t);
 }
 
 // ─── Image/Video provider name helpers ───
 const IMAGE_PROVIDER_NAMES: Record<ImageProviderId, string> = {
   seedream: 'providerSeedream',
+  'openai-image': 'providerOpenAIImage',
   'qwen-image': 'providerQwenImage',
   'nano-banana': 'providerNanoBanana',
+  'minimax-image': 'providerMiniMaxImage',
   'grok-image': 'providerGrokImage',
+  'comfyui-image': 'providerComfyUIImage',
+  lemonade: 'providerLemonadeImage',
 };
 
 const IMAGE_PROVIDER_ICONS: Record<ImageProviderId, string> = {
   seedream: '/logos/doubao.svg',
+  'openai-image': '/logos/openai.svg',
   'qwen-image': '/logos/bailian.svg',
   'nano-banana': '/logos/gemini.svg',
+  'minimax-image': '/logos/minimax.svg',
   'grok-image': '/logos/grok.svg',
+  'comfyui-image': '/logos/comfyui.svg',
+  lemonade: '/logos/lemonade.svg',
 };
 
 const VIDEO_PROVIDER_NAMES: Record<VideoProviderId, string> = {
   seedance: 'providerSeedance',
   kling: 'providerKling',
   veo: 'providerVeo',
-  sora: 'providerSora',
+  'minimax-video': 'providerMiniMaxVideo',
   'grok-video': 'providerGrokVideo',
+  happyhorse: 'providerHappyHorse',
 };
 
 const VIDEO_PROVIDER_ICONS: Record<VideoProviderId, string> = {
   seedance: '/logos/doubao.svg',
   kling: '/logos/kling.svg',
   veo: '/logos/gemini.svg',
-  sora: '/logos/openai.svg',
+  'minimax-video': '/logos/minimax.svg',
   'grok-video': '/logos/grok.svg',
+  happyhorse: '/logos/qwen.svg',
 };
 
 interface SettingsDialogProps {
@@ -194,7 +222,6 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
   const asrProvidersConfig = useSettingsStore((state) => state.asrProvidersConfig);
 
   // Store actions
-  const setModel = useSettingsStore((state) => state.setModel);
   const setProviderConfig = useSettingsStore((state) => state.setProviderConfig);
   const setProvidersConfig = useSettingsStore((state) => state.setProvidersConfig);
   const setTTSProvider = useSettingsStore((state) => state.setTTSProvider);
@@ -227,6 +254,20 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
 
   // Add provider dialog
   const [showAddProviderDialog, setShowAddProviderDialog] = useState(false);
+  const [showAddTTSProviderDialog, setShowAddTTSProviderDialog] = useState(false);
+  const [showAddASRProviderDialog, setShowAddASRProviderDialog] = useState(false);
+  const addCustomTTSProvider = useSettingsStore((state) => state.addCustomTTSProvider);
+  const addCustomASRProvider = useSettingsStore((state) => state.addCustomASRProvider);
+
+  const handleAddTTSProvider = (data: NewAudioProviderData) => {
+    const id = `custom-tts-${Date.now()}` as TTSProviderId;
+    addCustomTTSProvider(id, data.name, data.baseUrl, data.requiresApiKey, data.defaultModel);
+  };
+
+  const handleAddASRProvider = (data: NewAudioProviderData) => {
+    const id = `custom-asr-${Date.now()}` as ASRProviderId;
+    addCustomASRProvider(id, data.name, data.baseUrl, data.requiresApiKey);
+  };
 
   // Save status indicator
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved' | 'error'>('idle');
@@ -316,6 +357,9 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
         name: providersConfig[selectedProviderId].name,
         type: providersConfig[selectedProviderId].type,
         defaultBaseUrl: providersConfig[selectedProviderId].defaultBaseUrl,
+        baseUrlPlaceholder: PROVIDERS[selectedProviderId]?.baseUrlPlaceholder,
+        supportsModelDiscovery: PROVIDERS[selectedProviderId]?.supportsModelDiscovery,
+        alternateBaseUrls: PROVIDERS[selectedProviderId]?.alternateBaseUrls,
         icon: providersConfig[selectedProviderId].icon,
         requiresApiKey: providersConfig[selectedProviderId].requiresApiKey,
         models: providersConfig[selectedProviderId].models,
@@ -354,6 +398,27 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
     const currentModels = providersConfig[pid]?.models || [];
     const newModels = currentModels.filter((_, i) => i !== modelIndex);
     setProviderConfig(pid, { models: newModels });
+  };
+
+  // Merge probed model ids into the provider's model list. Previously
+  // probe-derived entries (`source: 'probed'`) are dropped first so a re-fetch
+  // (after the user changes base URL / API key) REPLACES the stale set instead
+  // of accumulating dead ids. Catalog and manually-added models are preserved.
+  // `modelInfoFromId(id, pid)` keeps built-in thinking capability so the
+  // thinking control isn't silently hidden for fetched built-in models.
+  const handleModelsFetched = (pid: ProviderId, fetchedIds: string[]): number => {
+    const currentModels = providersConfig[pid]?.models || [];
+    const kept = currentModels.filter((m) => m.source !== 'probed');
+    const keptIds = new Set(kept.map((m) => m.id));
+    const additions = fetchedIds
+      .filter((id) => !keptIds.has(id))
+      .map((id) => ({ ...modelInfoFromId(id, pid), source: 'probed' as const }));
+    const next = [...kept, ...additions];
+    // Write when the set changed at all — additions, or stale probed ids pruned.
+    if (additions.length > 0 || next.length !== currentModels.length) {
+      setProviderConfig(pid, { models: next });
+    }
+    return additions.length;
   };
 
   const handleAutoSaveModel = () => {
@@ -412,17 +477,14 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
     const newProviderId = `custom-${Date.now()}` as ProviderId;
     const updatedConfig = {
       ...providersConfig,
-      [newProviderId]: {
-        apiKey: '',
-        baseUrl: '',
-        models: [],
+      [newProviderId]: createCustomProviderSettings({
         name: providerData.name,
         type: providerData.type,
-        defaultBaseUrl: providerData.baseUrl || undefined,
-        icon: providerData.icon || undefined,
+        baseUrl: providerData.baseUrl,
+        icon: providerData.icon,
         requiresApiKey: providerData.requiresApiKey,
-        isBuiltIn: false,
-      },
+        modelsUrl: providerData.modelsUrl,
+      }),
     };
     setProvidersConfig(updatedConfig);
     setShowAddProviderDialog(false);
@@ -442,22 +504,16 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
     const pid = providerToDelete;
     const updatedConfig = { ...providersConfig };
     delete updatedConfig[pid];
+    // setProvidersConfig re-resolves the global (providerId, modelId)
+    // selection at the source (#580 invariant) — keep a still-usable
+    // provider, fall back to another usable one, or go to State A. No
+    // hand-rolled "pick the first config key" here: that ignored usability
+    // and could re-select an invalid/unusable provider.
     setProvidersConfig(updatedConfig);
     if (selectedProviderId === pid) {
+      // Settings-panel tab only (local UI), independent of model selection.
       const firstRemainingPid = Object.keys(updatedConfig)[0] as ProviderId | undefined;
       setSelectedProviderId(firstRemainingPid || 'openai');
-    }
-    if (providerId === pid) {
-      const firstRemainingPid = Object.keys(updatedConfig)[0] as ProviderId | undefined;
-      const firstModel = firstRemainingPid
-        ? updatedConfig[firstRemainingPid]?.serverModels?.[0] ||
-          updatedConfig[firstRemainingPid]?.models?.[0]?.id
-        : undefined;
-      if (firstRemainingPid && firstModel) {
-        setModel(firstRemainingPid, firstModel);
-      } else {
-        setModel('openai' as ProviderId, 'gpt-4o-mini');
-      }
     }
     setProviderToDelete(null);
   };
@@ -497,6 +553,15 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
     switch (activeSection) {
       case 'general':
         return <h2 className="text-lg font-semibold">{t('settings.systemSettings')}</h2>;
+      case 'skills':
+        return (
+          <>
+            <Sparkles className="h-6 w-6 text-muted-foreground" />
+            <h2 className="text-lg font-semibold">{t('settings.skills.title')}</h2>
+          </>
+        );
+      case 'token-plan':
+        return <h2 className="text-lg font-semibold">{t('settings.tokenPlan.nav')}</h2>;
       case 'providers':
         if (selectedProvider) {
           return (
@@ -505,7 +570,10 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
                 <img
                   src={selectedProvider.icon}
                   alt={selectedProvider.name}
-                  className="w-8 h-8 rounded"
+                  className={cn(
+                    'w-8 h-8 rounded',
+                    MONO_LOGO_PROVIDERS.has(selectedProvider.id) && 'dark:invert',
+                  )}
                   onError={(e) => {
                     (e.target as HTMLImageElement).style.display = 'none';
                   }}
@@ -514,7 +582,12 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
                 <Box className="h-8 w-8 text-muted-foreground" />
               )}
               <div>
-                <h2 className="text-lg font-semibold">{selectedProvider.name}</h2>
+                <h2 className="text-lg font-semibold">
+                  {t(`settings.providerNames.${selectedProvider.id}`) !==
+                  `settings.providerNames.${selectedProvider.id}`
+                    ? t(`settings.providerNames.${selectedProvider.id}`)
+                    : selectedProvider.name}
+                </h2>
                 <p className="text-xs text-muted-foreground">
                   {getProviderTypeLabel(selectedProvider.type, t)}
                 </p>
@@ -561,7 +634,9 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
             ) : (
               <Box className="h-8 w-8 text-muted-foreground" />
             )}
-            <h2 className="text-lg font-semibold">{wsProvider.name}</h2>
+            <h2 className="text-lg font-semibold">
+              {getWebSearchProviderDisplayName(wsProvider.id, t)}
+            </h2>
           </>
         );
       }
@@ -612,7 +687,7 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
         );
       }
       case 'tts': {
-        const ttsIcon = TTS_PROVIDERS[ttsProviderId]?.icon;
+        const ttsIcon = TTS_PROVIDERS[ttsProviderId as keyof typeof TTS_PROVIDERS]?.icon;
         return (
           <>
             {ttsIcon ? (
@@ -632,7 +707,7 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
         );
       }
       case 'asr': {
-        const asrIcon = ASR_PROVIDERS[asrProviderId]?.icon;
+        const asrIcon = ASR_PROVIDERS[asrProviderId as keyof typeof ASR_PROVIDERS]?.icon;
         return (
           <>
             {asrIcon ? (
@@ -664,6 +739,19 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
         <div className="flex h-full overflow-hidden">
           {/* Left Sidebar - Navigation */}
           <div className="flex-shrink-0 bg-muted/30 p-3 space-y-1" style={{ width: sidebarWidth }}>
+            <button
+              onClick={() => setActiveSection('token-plan')}
+              className={cn(
+                'w-full flex items-center gap-3 px-3 py-2 text-sm rounded-lg transition-colors text-left min-w-0',
+                activeSection === 'token-plan'
+                  ? 'bg-primary/10 text-primary font-medium'
+                  : 'hover:bg-muted',
+              )}
+            >
+              <CreditCard className="h-4 w-4 shrink-0" />
+              <span className="truncate">{t('settings.tokenPlan.nav')}</span>
+            </button>
+
             <button
               onClick={() => setActiveSection('providers')}
               className={cn(
@@ -739,7 +827,7 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
               )}
             >
               <FileText className="h-4 w-4 shrink-0" />
-              <span className="truncate">{t('settings.pdfSettings')}</span>
+              <span className="truncate">{t('settings.documentParsingSettings')}</span>
             </button>
 
             <button
@@ -753,6 +841,19 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
             >
               <Search className="h-4 w-4 shrink-0" />
               <span className="truncate">{t('settings.webSearchSettings')}</span>
+            </button>
+
+            <button
+              onClick={() => setActiveSection('skills')}
+              className={cn(
+                'w-full flex items-center gap-3 px-3 py-2 text-sm rounded-lg transition-colors text-left min-w-0',
+                activeSection === 'skills'
+                  ? 'bg-primary/10 text-primary font-medium'
+                  : 'hover:bg-muted',
+              )}
+            >
+              <Sparkles className="h-4 w-4 shrink-0" />
+              <span className="truncate">{t('settings.skills.nav')}</span>
             </button>
 
             <button
@@ -818,7 +919,10 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
           {activeSection === 'web-search' && (
             <>
               <ProviderListColumn
-                providers={Object.values(WEB_SEARCH_PROVIDERS)}
+                providers={Object.values(WEB_SEARCH_PROVIDERS).map((provider) => ({
+                  ...provider,
+                  name: getWebSearchProviderDisplayName(provider.id, t),
+                }))}
                 configs={webSearchProvidersConfig}
                 selectedId={selectedWebSearchProviderId}
                 onSelect={setSelectedWebSearchProviderId}
@@ -883,16 +987,26 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
           {activeSection === 'tts' && (
             <>
               <ProviderListColumn
-                providers={Object.values(TTS_PROVIDERS).map((p) => ({
-                  id: p.id,
-                  name: getTTSProviderName(p.id, t),
-                  icon: p.icon,
-                }))}
+                providers={[
+                  ...Object.values(TTS_PROVIDERS).map((p) => ({
+                    id: p.id,
+                    name: getTTSProviderName(p.id, t),
+                    icon: p.icon,
+                  })),
+                  ...Object.entries(ttsProvidersConfig)
+                    .filter(([id]) => isCustomTTSProvider(id))
+                    .map(([id, cfg]) => ({
+                      id: id as TTSProviderId,
+                      name: cfg.customName || id,
+                      icon: undefined,
+                    })),
+                ]}
                 configs={ttsProvidersConfig}
                 selectedId={ttsProviderId}
                 onSelect={setTTSProvider}
                 width={providerListWidth}
                 t={t}
+                onAdd={() => setShowAddTTSProviderDialog(true)}
               />
               <div
                 onMouseDown={(e) => handleResizeStart(e, 'providerList')}
@@ -906,16 +1020,26 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
           {activeSection === 'asr' && (
             <>
               <ProviderListColumn
-                providers={Object.values(ASR_PROVIDERS).map((p) => ({
-                  id: p.id,
-                  name: getASRProviderName(p.id, t),
-                  icon: p.icon,
-                }))}
+                providers={[
+                  ...Object.values(ASR_PROVIDERS).map((p) => ({
+                    id: p.id,
+                    name: getASRProviderName(p.id, t),
+                    icon: p.icon,
+                  })),
+                  ...Object.entries(asrProvidersConfig)
+                    .filter(([id]) => isCustomASRProvider(id))
+                    .map(([id, cfg]) => ({
+                      id: id as ASRProviderId,
+                      name: cfg.customName || id,
+                      icon: undefined,
+                    })),
+                ]}
                 configs={asrProvidersConfig}
                 selectedId={asrProviderId}
                 onSelect={setASRProvider}
                 width={providerListWidth}
                 t={t}
+                onAdd={() => setShowAddASRProviderDialog(true)}
               />
               <div
                 onMouseDown={(e) => handleResizeStart(e, 'providerList')}
@@ -953,6 +1077,10 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
             <div className="flex-1 overflow-y-auto p-5">
               {activeSection === 'general' && <GeneralSettings />}
 
+              {activeSection === 'skills' && <SkillSettings />}
+
+              {activeSection === 'token-plan' && <TokenPlanSettings />}
+
               {activeSection === 'providers' && selectedProvider && (
                 <ProviderConfigPanel
                   provider={selectedProvider}
@@ -969,6 +1097,8 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
                   onEditModel={(index) => handleEditModel(selectedProviderId, index)}
                   onDeleteModel={(index) => handleDeleteModel(selectedProviderId, index)}
                   onAddModel={handleAddModel}
+                  onModelsFetched={(ids) => handleModelsFetched(selectedProviderId, ids)}
+                  modelsUrl={providersConfig[selectedProviderId]?.modelsUrl}
                   onResetToDefault={() => handleResetProvider(selectedProviderId)}
                   isBuiltIn={providersConfig[selectedProviderId]?.isBuiltIn ?? true}
                 />
@@ -1028,6 +1158,7 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
         baseUrl={providersConfig[selectedProviderId]?.baseUrl}
         providerType={providersConfig[selectedProviderId]?.type}
         requiresApiKey={providersConfig[selectedProviderId]?.requiresApiKey}
+        isServerConfigured={providersConfig[selectedProviderId]?.isServerConfigured}
       />
 
       {/* Add Provider Dialog */}
@@ -1035,6 +1166,22 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
         open={showAddProviderDialog}
         onOpenChange={setShowAddProviderDialog}
         onAdd={handleAddProvider}
+      />
+
+      {/* Add TTS Provider Dialog */}
+      <AddAudioProviderDialog
+        open={showAddTTSProviderDialog}
+        onOpenChange={setShowAddTTSProviderDialog}
+        onAdd={handleAddTTSProvider}
+        type="tts"
+      />
+
+      {/* Add ASR Provider Dialog */}
+      <AddAudioProviderDialog
+        open={showAddASRProviderDialog}
+        onOpenChange={setShowAddASRProviderDialog}
+        onAdd={handleAddASRProvider}
+        type="asr"
       />
 
       {/* Delete Provider Confirmation */}
